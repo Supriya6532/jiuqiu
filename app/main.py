@@ -10,6 +10,7 @@ FastAPI 主应用
 """
 import sys
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from typing import Any, Dict, List, Optional
@@ -35,6 +36,15 @@ from app.rag import answer, answer_stream
 from app.vector_store import connect_milvus, ensure_collection, get_aggregate_stats
 from app.document_loader import load_and_split
 from app.vector_store import build_index
+from app.feishu_bot import start_ws_client
+
+
+# ========== 应用生命周期 ==========
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时开启飞书长连接，关闭时线程随进程退出（daemon）"""
+    start_ws_client()
+    yield
 
 # ========== OpenAPI Tags ==========
 openapi_tags = [
@@ -46,12 +56,17 @@ openapi_tags = [
         "name": "知识库",
         "description": "查询知识库状态或触发全量索引重建。",
     },
+    {
+        "name": "飞书机器人",
+        "description": "飞书 WebSocket 长连接，无需公网域名，应用启动时自动接入飞书并响应消息。",
+    },
 ]
 
 # ========== 创建应用 ==========
 app = FastAPI(
     title=API_TITLE,
     version=API_VERSION,
+    lifespan=lifespan,
     description=(
         "基于 OpenAI Embedding + Milvus 向量检索的 CRM 知识库 RAG 问答系统。\n\n"
         "**使用流程**\n"
@@ -79,6 +94,7 @@ app.add_middleware(
 static_dir = BASE_DIR / "static"
 static_dir.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
 
 
 # ========== 请求/响应模型 ==========

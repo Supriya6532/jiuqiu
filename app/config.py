@@ -49,3 +49,8 @@ API_HOST = "0.0.0.0"
 API_PORT = 8000
 API_TITLE = "CRM 知识库问答系统"
 API_VERSION = "1.0.0"
+
+# ========== 飞书机器人配置（长连接模式，无需公网域名）==========
+# 飞书开放平台 -> 凭证与基础信息 -> App ID / App Secret
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")

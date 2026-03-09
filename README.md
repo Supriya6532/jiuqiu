@@ -42,6 +42,7 @@ crm_kb/
 │   ├── document_loader.py # Markdown 解析与分块
 │   ├── vector_store.py    # Milvus 连接 + Embedding + 检索
 │   ├── rag.py             # RAG 问答核心（普通 + 流式）
+│   ├── feishu_bot.py      # 飞书机器人长连接（WebSocket 持久连接）
 │   └── main.py            # FastAPI 应用入口
 ├── scripts/
 │   └── build_index.py     # 一键构建向量索引
@@ -126,3 +127,104 @@ curl -X POST http://localhost:8000/api/chat \
 | `MILVUS_HOST` | `localhost` | Milvus 地址 |
 | `MILVUS_PORT` | `19530` | Milvus 端口 |
 | `MILVUS_COLLECTION` | `crm_knowledge_base` | 集合名称 |
+
+---
+
+## 飞书机器人接入
+
+> **推荐方式：长连接（WebSocket）**
+> 无需注册公网域名，无需配置加密策略。仅需在 `.env` 中填写 App ID / App Secret，
+> 服务启动时 SDK 自动向飞书建立出站 WebSocket 长连接，断线自动重连。
+
+### 架构说明
+
+```
+飞书用户 → @机器人 发送文本问题
+    │
+    ▼
+飞书平台 ──WS Push──▶ lark_oapi.ws.Client（出站长连接，本地端发起）
+                           │
+                       _on_message() 事件处理器
+                           │
+                       线程池执行 RAG answer()
+                           │
+                       飞书 IM API 回复消息
+```
+
+### 配置步骤
+
+#### 1. 创建飞书应用
+
+1. 打开 [飞书开放平台](https://open.feishu.cn/app) → **创建企业自建应用**
+2. 记录 **App ID** 和 **App Secret**
+
+#### 2. 添加应用权限
+
+进入应用 → **权限管理** → 开通以下权限：
+
+| 权限 | 用途 |
+|------|------|
+| `im:message` | 读取接收到的消息 |
+| `im:message:send_as_bot` | 以机器人身份回复消息 |
+| `im:message:send_urgent_as_bot` | 发送应用消息（含卡片） |
+| `cardkit:card:create` | 创建 Card Kit 流式卡片 |
+| `cardkit:card:update` | 更新卡片内容（流式刷新） |
+
+#### 3. 开启长连接（使用长连接接收事件）
+
+进入应用 → **事件订阅** → 选择**「使用长连接接收事件」**
+
+> 无需填写请求 URL，无需配置加密策略。
+
+订阅事件：添加 **接收消息** (`im.message.receive_v1`)
+
+#### 4. 配置 .env
+
+```bash
+# 飞书机器人（仅需两项）
+FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
+FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+#### 5. 安装依赖
+
+```bash
+pip install lark-oapi
+```
+
+#### 6. 发布应用
+
+进入应用 → **版本管理与发布** → 创建版本 → 提交审核（或在测试版中直接启用）
+
+#### 7. 启动服务
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+服务启动时日志会输出：
+
+```
+[feishu] WebSocket 长连接客户端启动中…
+[feishu] 飞书长连接线程已启动（daemon=True）
+```
+
+#### 8. 使用方式
+
+- **私聊**：直接向机器人发送文本消息
+- **群聊**：将机器人拉入群，发消息时 **@机器人名称** + 问题内容
+
+**示例：**
+
+```
+@CRM助手 张三最近跟进了哪些客户？
+```
+
+机器人将自动回复 RAG 查询结果，并附上来源记录（最多 3 条）。
+
+### 注意事项
+
+- 长连接为**出站连接**，本地开发无需内网穿透，也无需公网 IP
+- RAG 查询在独立线程池（4 并发）中执行，不阻塞 WebSocket 事件循环
+- SDK 内部自动重连，进程存活期间连接始终保持
+- 未配置 `FEISHU_APP_ID` 时服务正常启动，仅跳过飞书连接（不影响 Web API）

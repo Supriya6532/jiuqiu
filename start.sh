@@ -68,4 +68,4 @@ echo "  API 文档: http://localhost:8000/docs"
 echo "  按 Ctrl+C 停止服务"
 echo "========================================================"
 echo ""
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+PYTHONPATH="$SCRIPT_DIR" uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
