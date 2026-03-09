@@ -263,6 +263,34 @@
       .layout { flex-direction: column; }
       .sidebar { width: 100%; }
     }
+
+    /* ===== Feedback buttons ===== */
+    .feedback-bar {
+      display: flex; gap: 8px; align-items: center;
+      margin-top: 8px; flex-wrap: wrap;
+    }
+    .fb-btn {
+      background: none; border: 1px solid var(--border);
+      border-radius: 6px; padding: 4px 11px; font-size: 13px;
+      cursor: pointer; color: var(--muted); transition: all .15s;
+      line-height: 1.6;
+    }
+    .fb-btn:hover { border-color: var(--primary); color: var(--primary); }
+    .fb-btn.active-up   { background: #dcfce7; border-color: #22c55e; color: #16a34a; }
+    .fb-btn.active-down { background: #fee2e2; border-color: #ef4444; color: #dc2626; }
+    .fb-label { font-size: 12px; color: var(--muted); }
+
+    /* ===== Quality panel ===== */
+    .score-row {
+      display: flex; align-items: center;
+      justify-content: space-between; padding: 5px 0; font-size: 13px;
+    }
+    .score-bar {
+      flex: 1; height: 6px; background: var(--border);
+      border-radius: 3px; margin: 0 10px;
+    }
+    .score-fill { height: 100%; border-radius: 3px; background: var(--primary); transition: width .4s; }
+    .score-val  { font-weight: 600; color: var(--primary); min-width: 30px; text-align: right; }
   </style>
 </head>
 <body>
@@ -324,6 +352,31 @@
       <button id="rebuild-btn" onclick="rebuildIndex()">🔄 重建索引</button>
       <div id="rebuild-msg"></div>
     </div>
+
+    <div class="card" id="quality-card">
+      <h3>回答质量</h3>
+      <div class="stat-row"><span>总问答数</span><span id="q-total">—</span></div>
+      <div class="stat-divider"></div>
+      <div class="stat-row"><span>好评率</span><span id="q-uprate">—</span></div>
+      <div class="stat-divider"></div>
+      <div class="stat-row"><span>平均响应</span><span id="q-ms">—</span></div>
+      <div class="stat-divider"></div>
+      <div class="score-row">
+        <span>相关性</span>
+        <div class="score-bar"><div class="score-fill" id="q-rel-bar" style="width:0%"></div></div>
+        <span class="score-val" id="q-rel">—</span>
+      </div>
+      <div class="score-row">
+        <span>完整性</span>
+        <div class="score-bar"><div class="score-fill" id="q-comp-bar" style="width:0%"></div></div>
+        <span class="score-val" id="q-comp">—</span>
+      </div>
+      <div class="score-row">
+        <span>准确性</span>
+        <div class="score-bar"><div class="score-fill" id="q-acc-bar" style="width:0%"></div></div>
+        <span class="score-val" id="q-acc">—</span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -332,6 +385,7 @@
   const questionEl = document.getElementById('question');
   const sendBtn    = document.getElementById('send-btn');
   let isStreaming  = false;
+  let currentAnswerId = null; // 当前回答对应的 answer_id
 
   // ===== 健康检查 =====
   async function checkHealth() {
@@ -358,6 +412,53 @@
   }
   checkHealth();
   setInterval(checkHealth, 30000);
+
+  // ===== 质量看板 =====
+  async function loadQualityStats() {
+    try {
+      const res  = await fetch('/api/feedback/stats');
+      const body = await res.json();
+      if (!body.success) return;
+      const d = body.data;
+      document.getElementById('q-total').textContent = d.total || 0;
+      document.getElementById('q-uprate').textContent =
+        d.thumbs_up_rate !== null ? (d.thumbs_up_rate * 100).toFixed(0) + '%' : '—';
+      document.getElementById('q-ms').textContent =
+        d.avg_response_ms !== null ? (d.avg_response_ms / 1000).toFixed(1) + 's' : '—';
+      const setScore = (barId, valId, val) => {
+        document.getElementById(valId).textContent = val !== null ? val.toFixed(1) : '—';
+        document.getElementById(barId).style.width = val !== null ? ((val - 1) / 4 * 100).toFixed(0) + '%' : '0%';
+      };
+      setScore('q-rel-bar',  'q-rel',  d.avg_llm_relevance);
+      setScore('q-comp-bar', 'q-comp', d.avg_llm_completeness);
+      setScore('q-acc-bar',  'q-acc',  d.avg_llm_accuracy);
+    } catch (e) {
+      console.warn('quality stats failed:', e);
+    }
+  }
+  loadQualityStats();
+  setInterval(loadQualityStats, 60000);
+
+  // ===== 提交反馈 =====
+  async function submitFeedback(answerId, thumbs, btn) {
+    try {
+      const res = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer_id: answerId, thumbs, trigger_judge: true }),
+      });
+      if (!res.ok) return;
+      // 更新按钮样式
+      const bar = btn.closest('.feedback-bar');
+      bar.querySelectorAll('.fb-btn').forEach(b => b.classList.remove('active-up', 'active-down'));
+      btn.classList.add(thumbs === 1 ? 'active-up' : 'active-down');
+      const label = bar.querySelector('.fb-label');
+      if (label) label.textContent = thumbs === 1 ? '感谢反馈 🙏' : '感谢反馈';
+      setTimeout(loadQualityStats, 3000); // 稍后刷新看板
+    } catch (e) {
+      console.warn('feedback failed:', e);
+    }
+  }
 
   // ===== 自动调整输入框高度 =====
   questionEl.addEventListener('input', () => {
@@ -522,6 +623,20 @@
                 botBubble.textContent = `❌ ${errText}`;
               } else {
                 addMessage('bot', `❌ ${errText}`);
+              }
+
+            } else if (payload.type === 'answer_id') {
+              // 收到 answer_id，带出赞/踩按钮
+              currentAnswerId = payload.id;
+              if (botWrapper && currentAnswerId) {
+                const feedbackBar = document.createElement('div');
+                feedbackBar.className = 'feedback-bar';
+                feedbackBar.innerHTML = `
+                  <span class="fb-label">这个回答对您有帮助吗？</span>
+                  <button class="fb-btn" onclick="submitFeedback('${currentAnswerId}', 1, this)">👍 有帮助</button>
+                  <button class="fb-btn" onclick="submitFeedback('${currentAnswerId}', -1, this)">👎 无帮助</button>
+                `;
+                botWrapper.appendChild(feedbackBar);
               }
 
             } else if (payload.type === 'done') {

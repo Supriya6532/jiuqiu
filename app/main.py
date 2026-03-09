@@ -9,7 +9,9 @@ FastAPI 主应用
   GET  /api/stats     - 知识库统计信息
 """
 import sys
+import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -37,12 +39,14 @@ from app.vector_store import connect_milvus, ensure_collection, get_aggregate_st
 from app.document_loader import load_and_split
 from app.vector_store import build_index
 from app.feishu_bot import start_ws_client
+from app.feedback import init_db, save_qa, save_thumbs, trigger_judge, get_stats as get_feedback_stats
 
 
 # ========== 应用生命周期 ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时开启飞书长连接，关闭时线程随进程退出（daemon）"""
+    """启动时开启飞书长连接 + 初始化反馈数据库"""
+    init_db()
     start_ws_client()
     yield
 
@@ -237,11 +241,18 @@ async def health_check():
     tags=["问答"],
 )
 async def chat(req: ChatRequest):
-    """普通问答，返回完整 JSON"""
+    """普通问答，返回完整 JSON（含 answer_id，可用于提交反馈）"""
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
     try:
+        start_ms = int(time.time() * 1000)
         result = answer(req.question, top_k=req.top_k)
+        response_ms = int(time.time() * 1000) - start_ms
+        answer_text = result.get("answer", "")
+        sources = result.get("sources", [])
+        if answer_text:
+            aid = save_qa(req.question, answer_text, sources, response_ms)
+            result["answer_id"] = aid
         return {"success": True, "data": result}
     except ConnectionError as e:
         raise HTTPException(status_code=503, detail=f"向量数据库连接失败: {e}")
@@ -266,12 +277,43 @@ async def chat(req: ChatRequest):
     responses={200: {"content": {"text/event-stream": {}}, "description": "SSE 流式回答"}},
 )
 async def chat_stream(req: ChatRequest):
-    """流式问答，使用 SSE（Server-Sent Events）"""
+    """流式问答，使用 SSE（Server-Sent Events）
+    流结束后额外推送 type=answer_id 事件，前端可用于提交赞/踩反馈。
+    """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
+
+    def _stream_with_feedback():
+        """包装 answer_stream，流结束后注入 answer_id 并写入反馈数据库"""
+        tokens: list[str] = []
+        sources: list = []
+        start_ms = int(time.time() * 1000)
+
+        for raw in answer_stream(req.question, top_k=req.top_k):
+            # 先解析，再原样 yield（不改变下游行为）
+            data_str = raw.removeprefix("data:").strip()
+            if data_str:
+                try:
+                    chunk = json.loads(data_str)
+                    ctype = chunk.get("type", "")
+                    if ctype == "token":
+                        tokens.append(chunk.get("content", ""))
+                    elif ctype == "sources":
+                        sources = chunk.get("sources", [])
+                except Exception:
+                    pass
+            yield raw
+
+        # 所有 chunk 发完后，保存到 DB 并推送 answer_id
+        response_ms = int(time.time() * 1000) - start_ms
+        full_answer = "".join(tokens).strip()
+        if full_answer:
+            aid = save_qa(req.question, full_answer, sources, response_ms)
+            yield f"data: {json.dumps({'type': 'answer_id', 'id': aid}, ensure_ascii=False)}\n\n"
+
     try:
         return StreamingResponse(
-            answer_stream(req.question, top_k=req.top_k),
+            _stream_with_feedback(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -338,6 +380,51 @@ async def get_stats():
             },
         }
     except Exception as e:
+        return {"success": False, "detail": str(e)}
+
+
+# ========== 反馈 & 质量看板 ==========
+
+class FeedbackRequest(BaseModel):
+    answer_id: str = Field(..., description="问答记录 ID（由 answer_id 事件或响应体中获取）")
+    thumbs: int = Field(..., description="1 = 赞，-1 = 踩")
+    trigger_judge: bool = Field(default=True, description="是否异步触发 LLM-as-Judge 评分")
+
+
+@app.post(
+    "/api/feedback",
+    summary="提交回答反馈（赞/踩）",
+    description="用户对某条回答点赞或踩，可选触发 LLM-as-Judge 自动评分（后台异步执行）。",
+    operation_id="submitFeedback",
+    tags=["质量评价"],
+)
+async def submit_feedback(req: FeedbackRequest):
+    ok = save_thumbs(req.answer_id, req.thumbs)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"找不到 answer_id={req.answer_id}")
+    if req.trigger_judge:
+        trigger_judge(req.answer_id)
+    return {"success": True, "answer_id": req.answer_id, "thumbs": req.thumbs}
+
+
+@app.get(
+    "/api/feedback/stats",
+    summary="质量看板统计数据",
+    description=(
+        "返回全部问答的聚合质量指标：\n\n"
+        "- 总问答数、好评率\n"
+        "- LLM-as-Judge 平均相关性 / 完整性 / 准确性\n"
+        "- 平均响应时间\n"
+        "- 近 30 条问答明细（含用户反馈 + LLM 评分）"
+    ),
+    operation_id="getFeedbackStats",
+    tags=["质量评价"],
+)
+async def feedback_stats():
+    try:
+        return {"success": True, "data": get_feedback_stats()}
+    except Exception as e:
+        logger.error(f"[feedback_stats] 失败: {e}", exc_info=True)
         return {"success": False, "detail": str(e)}
 
 

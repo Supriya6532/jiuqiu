@@ -14,7 +14,9 @@
 6. [元数据精确过滤路由](#6-元数据精确过滤路由)
 7. [聚合关键词量词变体正则修复](#7-聚合关键词量词变体正则修复)
 8. [开源前脱敏处理](#8-开源前脱敏处理)
-9. [后续优化方向](#9-后续优化方向)
+9. [飞书 WebSocket 长连接机器人](#9-飞书-websocket-长连接机器人)
+10. [回答质量评价体系](#10-回答质量评价体系)
+11. [后续优化方向](#11-后续优化方向)
 3. [日志系统增强](#3-日志系统增强)
 4. [OpenAPI 规范化（OpenClaw 接入）](#4-openapi-规范化openclaw-接入)
 5. [聚合查询修复](#5-聚合查询修复)
@@ -494,7 +496,131 @@ __pycache__/
 
 ---
 
-## 9. 后续优化方向
+## 9. 飞书 WebSocket 长连接机器人
+
+**文件**: `app/feishu_bot.py`, `app/main.py`, `app/config.py`
+
+### 功能
+
+使用飞书官方 `lark-oapi` SDK 的 WebSocket 长连接模式接入飞书机器人：
+
+- 无需公网域名或 HTTPS 证书
+- 应用启动时自动建立出站 WebSocket 连接，断线自动重连
+- Card Kit 流式卡片回复，用户实时看到 token 逐字输出
+
+### 延迟优化
+
+`lark_oapi` SDK 默认断线重连有 0~30s 随机等待（`_reconnect_nonce=30`），通过子类化覆盖：
+
+```python
+class _FastWSClient(lark.ws.Client):
+    def _configure(self, conf):
+        super()._configure(conf)
+        self._reconnect_nonce    = 0    # 断线立即重连
+        self._reconnect_interval = 3    # 重试间隔 3s
+        self._ping_interval      = 600  # 心跳 10 分钟（节省 API 调用）
+```
+
+重连延迟从 0~30s 降低到 <1s。
+
+---
+
+## 10. 回答质量评价体系
+
+**文件**: `app/feedback.py`（新增）、`app/main.py`、`static/index.html`、`scripts/benchmark.py`（新增）
+
+### 10.1 系统架构
+
+```
+用户问答
+  │
+  ├─ 写入 feedback.db (SQLite)
+  │    qa_log: question / answer / sources / response_ms / created_at
+  │
+  ├─ 前端显示 👍 / 👎 按钮 (type=answer_id 事件触发)
+  │    └─ POST /api/feedback → 更新 thumbs 字段 + 异步触发 LLM 评分
+  │
+  └─ LLM-as-Judge (后台线程)
+       │  相关性 / 完整性 / 准确性  1.0~5.0 分
+       └─ 写回 llm_relevance / llm_completeness / llm_accuracy
+
+GET /api/feedback/stats → 汇总指标 + 近 30 条明细
+```
+
+### 10.2 数据库表结构
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | TEXT (UUID) | 主键，即 answer_id |
+| `question` | TEXT | 用户问题 |
+| `answer` | TEXT | 完整回答 |
+| `sources_json` | TEXT | 来源列表 JSON |
+| `response_ms` | INTEGER | 端到端响应毫秒数 |
+| `created_at` | TEXT | 创建时间 |
+| `thumbs` | INTEGER | 1=赞 / -1=踩 / NULL=未评 |
+| `llm_relevance` | REAL | 相关性 1.0~5.0 |
+| `llm_completeness` | REAL | 完整性 1.0~5.0 |
+| `llm_accuracy` | REAL | 准确性 1.0~5.0 |
+| `llm_comment` | TEXT | LLM 评语 |
+| `llm_judged_at` | TEXT | 评分时间 |
+
+### 10.3 新增 API 端点
+
+| operationId | 方法 | 路径 | 说明 |
+|---|---|---|---|
+| `submitFeedback` | POST | `/api/feedback` | 提交赞/踩，可选触发 LLM 评分 |
+| `getFeedbackStats` | GET | `/api/feedback/stats` | 看板汇总数据 |
+
+`/api/chat` 和 `/api/chat/stream` 响应中新增 `answer_id` 字段，前端凭此提交反馈。
+
+### 10.4 流式接口 answer_id 注入
+
+流式结束后额外推送一个 SSE 事件：
+
+```
+data: {"type": "answer_id", "id": "550e8400-e29b-41d4-a716-446655440000"}
+```
+
+前端收到后渲染赞/踩按钮，用 `answer_id` 关联反馈记录。
+
+### 10.5 LLM-as-Judge 评分规则
+
+```
+评分维度（1.0~5.0）：
+  relevance     相关性 — 回答是否切题、基于问题作答
+  completeness  完整性 — 是否覆盖问题各方面
+  accuracy      准确性 — 内容是否准确、引用有据可查
+
+触发时机：用户点击 👍/👎 后异步执行，不阻塞响应
+模型：复用 OPENAI_CHAT_MODEL 配置
+```
+
+### 10.6 基准测试集
+
+`scripts/benchmark.py` 内置 11 条用例（聚合 / 元数据过滤 / 语义检索 / 鲁棒性四类）：
+
+```bash
+# 运行全量基准测试
+python3 scripts/benchmark.py
+
+# 只测第 5 条
+python3 scripts/benchmark.py --case 5
+
+# 跳过 LLM 评分（快速冒烟测试）
+python3 scripts/benchmark.py --no-judge
+```
+
+结果追加写入 `data/benchmark_results.jsonl`，可用于趋势对比。
+
+### 10.7 前端质量看板
+
+侧边栏新增「回答质量」卡片，展示：
+- 总问答数 / 好评率 / 平均响应时间
+- 相关性 / 完整性 / 准确性进度条（每 60s 自动刷新）
+
+---
+
+## 11. 后续优化方向
 
 ### 9.1 回答质量评价体系
 
@@ -505,7 +631,7 @@ __pycache__/
 - **基准测试集**: 维护一组标准 Q&A，每次修改后自动回归测试，防止质量下降
 - **指标看板**: 跟踪准确率 / 响应时间 / 用户满意度等趋势
 
-### 9.2 检索增强 (Advanced RAG)
+### 11.1 检索增强 (Advanced RAG)
 
 当前单路向量检索 + top_k 方式存在召回率不足的问题。
 
@@ -514,7 +640,7 @@ __pycache__/
 - **重排序 (Reranking)**: 检索后用 Cross-Encoder（如 `bge-reranker`）对结果二次排序，提高精度
 - **父文档检索 (Parent Document Retrieval)**: 小块检索、大块返回，兆合精准检索和充分上下文
 
-### 9.3 多轮对话与上下文记忆
+### 11.2 多轮对话与上下文记忆
 
 当前每次问答独立，无法处理连续追问。
 
@@ -522,7 +648,7 @@ __pycache__/
 - **指代消解**: 在检索前将“他们”“这个客户”等指代词解析为具体实体
 - **对话摘要**: 较长对话自动压缩历史上下文，避免 token 溢出
 
-### 9.4 分块策略优化
+### 11.3 分块策略优化
 
 当前按固定 `---` 分隔符 + 字数上限切块，未考虑语义完整性。
 
@@ -530,7 +656,7 @@ __pycache__/
 - **元数据丰富化**: 提取更多结构化字段（行业 / 商机阶段 / 金额）存入 Milvus，支持更精细的过滤
 - **动态块大小**: 根据内容长度自动调整，短活动记录不拆分，长记录按语义边界拆分
 
-### 9.5 权限与多租户
+### 11.4 权限与多租户
 
 当前无身份认证，所有用户看到相同数据。
 
@@ -538,7 +664,7 @@ __pycache__/
 - **API 认证**: 接入 API Key / JWT / OAuth2，保护接口安全
 - **操作审计**: 记录每次查询的用户、问题、检索范围，便于合规审计
 
-### 9.6 增量索引与实时同步
+### 11.5 增量索引与实时同步
 
 当前每次更新需要重建全量索引。
 
@@ -546,20 +672,20 @@ __pycache__/
 - **Webhook 触发**: CRM 系统新增活动记录时通过 Webhook 自动更新向量库
 - **删除/更新同步**: 当源文档修改或删除时，自动清理对应向量
 
-### 9.7 可观测性与监控
+### 11.6 可观测性与监控
 
 - **链路追踪 (Tracing)**: 接入 LangSmith / Langfuse，记录每次请求的完整链路（问题分类 → 检索 → Prompt 构建 → LLM 调用）
 - **Token 用量统计**: 按用户/时段统计 Embedding 和 Chat 的 token 消耗，控制成本
 - **异常告警**: 响应时间超阈值 / 检索结果为空 / API 调用失败时自动告警
 
-### 9.8 前端体验优化
+### 11.7 前端体验优化
 
 - **Markdown 渲染**: 回答中的表格 / 代码块 / 列表正确渲染，而非纯文本展示
 - **来源可视化**: 点击来源可展开原文片段，关键词高亮
 - **导出功能**: 支持将问答结果导出为 PDF / Markdown
 - **移动端适配**: 响应式布局，支持移动端访问
 
-### 9.9 知识库扩展
+### 11.8 知识库扩展
 
 - **多数据源接入**: 除 Markdown 外，支持从 CRM 数据库 / 飞书 / 钉钉 / 企微直接拉取数据
 - **文档类型扩展**: 支持 PDF / Word / Excel / 图片 OCR 等格式
