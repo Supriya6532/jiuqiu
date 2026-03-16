@@ -39,7 +39,7 @@ from app.vector_store import connect_milvus, ensure_collection, get_aggregate_st
 from app.document_loader import load_and_split
 from app.vector_store import build_index
 from app.feishu_bot import start_ws_client
-from app.feedback import init_db, save_qa, save_thumbs, trigger_judge, get_stats as get_feedback_stats
+from app.feedback import init_db, save_qa, save_thumbs, save_manual_scores, trigger_judge, get_stats as get_feedback_stats
 
 
 # ========== 应用生命周期 ==========
@@ -387,24 +387,59 @@ async def get_stats():
 
 class FeedbackRequest(BaseModel):
     answer_id: str = Field(..., description="问答记录 ID（由 answer_id 事件或响应体中获取）")
-    thumbs: int = Field(..., description="1 = 赞，-1 = 踩")
+    thumbs: Optional[int] = Field(default=None, description="1 = 赞，-1 = 踩；与手动打分不互斥")
     trigger_judge: bool = Field(default=True, description="是否异步触发 LLM-as-Judge 评分")
+    # 手动打分（1~5 整数）
+    manual_relevance:    Optional[float] = Field(default=None, ge=1, le=5, description="相关性 1~5")
+    manual_completeness: Optional[float] = Field(default=None, ge=1, le=5, description="完整性 1~5")
+    manual_accuracy:     Optional[float] = Field(default=None, ge=1, le=5, description="准确性 1~5")
+    manual_comment:      Optional[str]   = Field(default=None, description="手动评语（可选）")
 
 
 @app.post(
     "/api/feedback",
-    summary="提交回答反馈（赞/踩）",
-    description="用户对某条回答点赞或踩，可选触发 LLM-as-Judge 自动评分（后台异步执行）。",
+    summary="提交回答反馈（赞/踩 + 可选手动打分）",
+    description=(
+        "提交对某条回答的评价。支持两种模式：\n\n"
+        "1. **快速反馈**：仅传 `thumbs`（1=赞 / -1=踩）\n"
+        "2. **手动打分**：传 `manual_relevance` / `manual_completeness` / `manual_accuracy`（1~5 分）\n\n"
+        "两种模式可同时使用。手动打分会根据平均分自动推算 `thumbs`（≥3.5→赞）。"
+    ),
     operation_id="submitFeedback",
     tags=["质量评价"],
 )
 async def submit_feedback(req: FeedbackRequest):
-    ok = save_thumbs(req.answer_id, req.thumbs)
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"找不到 answer_id={req.answer_id}")
+    has_thumbs = req.thumbs is not None
+    has_manual = all(v is not None for v in [req.manual_relevance, req.manual_completeness, req.manual_accuracy])
+
+    if not has_thumbs and not has_manual:
+        raise HTTPException(status_code=422, detail="请提供 thumbs 或 manual_relevance/completeness/accuracy")
+
+    if has_thumbs:
+        ok = save_thumbs(req.answer_id, req.thumbs)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"找不到 answer_id={req.answer_id}")
+
+    if has_manual:
+        ok = save_manual_scores(
+            req.answer_id,
+            req.manual_relevance,
+            req.manual_completeness,
+            req.manual_accuracy,
+            req.manual_comment or "",
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"找不到 answer_id={req.answer_id}")
+
     if req.trigger_judge:
         trigger_judge(req.answer_id)
-    return {"success": True, "answer_id": req.answer_id, "thumbs": req.thumbs}
+
+    return {
+        "success": True,
+        "answer_id": req.answer_id,
+        "thumbs": req.thumbs,
+        "manual_scored": has_manual,
+    }
 
 
 @app.get(
@@ -448,4 +483,420 @@ async def list_companies():
         return {"success": True, **stats}
     except Exception as e:
         logger.error(f"[list_companies] 失败: {e}", exc_info=True)
+        return {"success": False, "detail": str(e)}
+
+
+# ========== MCP 数据源管理 ==========
+
+class MCPSourceConfig(BaseModel):
+    name: str = Field(..., description="数据源名称")
+    type: str = Field(..., description="数据源类型：filesystem/http/database")
+    enabled: bool = Field(default=True, description="是否启用")
+    config: Dict[str, Any] = Field(default_factory=dict, description="数据源配置")
+
+
+@app.get(
+    "/api/mcp/sources",
+    summary="获取 MCP 数据源列表",
+    description="返回所有已配置的 MCP 数据源",
+    operation_id="getMCPSources",
+    tags=["MCP 数据源"],
+)
+async def get_mcp_sources():
+    """获取 MCP 数据源列表"""
+    try:
+        config_path = BASE_DIR / "mcp_config.json"
+        if not config_path.exists():
+            return {"success": True, "sources": []}
+
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        sources = config.get("mcp_sources", [])
+        return {"success": True, "sources": sources}
+    except Exception as e:
+        logger.error(f"[get_mcp_sources] 失败: {e}", exc_info=True)
+        return {"success": False, "detail": str(e)}
+
+
+@app.post(
+    "/api/mcp/sources",
+    summary="添加 MCP 数据源",
+    description="添加新的 MCP 数据源配置",
+    operation_id="addMCPSource",
+    tags=["MCP 数据源"],
+)
+async def add_mcp_source(source: MCPSourceConfig):
+    """添加 MCP 数据源"""
+    try:
+        config_path = BASE_DIR / "mcp_config.json"
+
+        # 读取现有配置
+        if config_path.exists():
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        else:
+            config = {"mcp_sources": []}
+
+        # 检查是否已存在同名数据源
+        sources = config.get("mcp_sources", [])
+        if any(s.get("name") == source.name for s in sources):
+            raise HTTPException(status_code=400, detail=f"数据源 {source.name} 已存在")
+
+        # 添加新数据源
+        new_source = {
+            "name": source.name,
+            "type": source.type,
+            "enabled": source.enabled,
+            **source.config
+        }
+        sources.append(new_source)
+        config["mcp_sources"] = sources
+
+        # 保存配置
+        config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        return {"success": True, "message": f"数据源 {source.name} 添加成功"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[add_mcp_source] 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put(
+    "/api/mcp/sources/{source_name}",
+    summary="更新 MCP 数据源",
+    description="更新指定的 MCP 数据源配置",
+    operation_id="updateMCPSource",
+    tags=["MCP 数据源"],
+)
+async def update_mcp_source(source_name: str, source: MCPSourceConfig):
+    """更新 MCP 数据源"""
+    try:
+        config_path = BASE_DIR / "mcp_config.json"
+        if not config_path.exists():
+            raise HTTPException(status_code=404, detail="配置文件不存在")
+
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        sources = config.get("mcp_sources", [])
+
+        # 查找并更新数据源
+        found = False
+        for i, s in enumerate(sources):
+            if s.get("name") == source_name:
+                sources[i] = {
+                    "name": source.name,
+                    "type": source.type,
+                    "enabled": source.enabled,
+                    **source.config
+                }
+                found = True
+                break
+
+        if not found:
+            raise HTTPException(status_code=404, detail=f"数据源 {source_name} 不存在")
+
+        config["mcp_sources"] = sources
+        config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        return {"success": True, "message": f"数据源 {source_name} 更新成功"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[update_mcp_source] 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete(
+    "/api/mcp/sources/{source_name}",
+    summary="删除 MCP 数据源",
+    description="删除指定的 MCP 数据源",
+    operation_id="deleteMCPSource",
+    tags=["MCP 数据源"],
+)
+async def delete_mcp_source(source_name: str):
+    """删除 MCP 数据源"""
+    try:
+        config_path = BASE_DIR / "mcp_config.json"
+        if not config_path.exists():
+            raise HTTPException(status_code=404, detail="配置文件不存在")
+
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        sources = config.get("mcp_sources", [])
+
+        # 过滤掉要删除的数据源
+        new_sources = [s for s in sources if s.get("name") != source_name]
+
+        if len(new_sources) == len(sources):
+            raise HTTPException(status_code=404, detail=f"数据源 {source_name} 不存在")
+
+        config["mcp_sources"] = new_sources
+        config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        return {"success": True, "message": f"数据源 {source_name} 删除成功"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[delete_mcp_source] 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/api/mcp/sources/{source_name}/test",
+    summary="测试 MCP 数据源连接",
+    description="测试指定数据源的连接是否正常",
+    operation_id="testMCPSource",
+    tags=["MCP 数据源"],
+)
+async def test_mcp_source(source_name: str):
+    """测试 MCP 数据源连接"""
+    try:
+        config_path = BASE_DIR / "mcp_config.json"
+        if not config_path.exists():
+            raise HTTPException(status_code=404, detail="配置文件不存在")
+
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        sources = config.get("mcp_sources", [])
+
+        # 查找数据源
+        source_config = None
+        for s in sources:
+            if s.get("name") == source_name:
+                source_config = s
+                break
+
+        if not source_config:
+            raise HTTPException(status_code=404, detail=f"数据源 {source_name} 不存在")
+
+        # 测试连接
+        from app.mcp_loader import MCP_SOURCE_TYPES
+        source_type = source_config.get("type")
+        source_class = MCP_SOURCE_TYPES.get(source_type)
+
+        if not source_class:
+            raise HTTPException(status_code=400, detail=f"不支持的数据源类型: {source_type}")
+
+        source = source_class(source_name, source_config)
+        docs = source.fetch_data()
+
+        return {
+            "success": True,
+            "message": "连接测试成功",
+            "doc_count": len(docs),
+            "sample": docs[0] if docs else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[test_mcp_source] 失败: {e}", exc_info=True)
+        return {"success": False, "detail": str(e)}
+
+
+# ========== MCP 协议支持（服务发现）==========
+
+@app.post(
+    "/api/mcp/discover",
+    summary="MCP 服务发现",
+    description="连接到 MCP 服务器并发现可用资源（支持 HTTP REST 和 SSE 传输）",
+    operation_id="discoverMCPResources",
+    tags=["MCP 数据源"],
+)
+async def discover_mcp_resources(request: Dict[str, str]):
+    """MCP 服务发现"""
+    try:
+        base_url = request.get("base_url", "")
+        if not base_url:
+            raise HTTPException(status_code=400, detail="base_url 不能为空")
+
+        # 尝试 SSE 传输（标准 MCP-over-SSE）
+        try:
+            from app.mcp_sse_async_client import MCPSSEAsyncClient
+            async with MCPSSEAsyncClient(base_url) as client:
+                resources = await client.discover_resources()
+                if resources:
+                    logger.info(f"[MCP] 使用 SSE 传输成功连接到 {base_url}")
+                    return {
+                        "success": True,
+                        "resources": resources,
+                        "server_url": base_url,
+                        "transport": "sse"
+                    }
+        except Exception as sse_error:
+            logger.warning(f"[MCP] SSE 传输失败，尝试 HTTP REST: {sse_error}")
+
+        # 回退到 HTTP REST API
+        from app.mcp_client import MCPClient
+        client = MCPClient(base_url)
+        try:
+            resources = client.discover_resources()
+            logger.info(f"[MCP] 使用 HTTP REST 成功连接到 {base_url}")
+            return {
+                "success": True,
+                "resources": resources,
+                "server_url": base_url,
+                "transport": "http"
+            }
+        finally:
+            client.close()
+
+    except Exception as e:
+        logger.error(f"[discover_mcp] 失败: {e}", exc_info=True)
+        return {"success": False, "detail": str(e)}
+
+
+@app.post(
+    "/api/mcp/preview",
+    summary="预览 MCP 资源数据",
+    description="获取资源的样本数据和分块建议（支持 HTTP REST 和 SSE 传输）",
+    operation_id="previewMCPResource",
+    tags=["MCP 数据源"],
+)
+async def preview_mcp_resource(request: Dict[str, Any]):
+    """预览 MCP 资源数据"""
+    try:
+        base_url = request.get("base_url", "")
+        resource_uri = request.get("resource_uri", "")
+        filters = request.get("filters", {})
+
+        if not base_url or not resource_uri:
+            raise HTTPException(status_code=400, detail="base_url 和 resource_uri 不能为空")
+
+        # 尝试 SSE 传输
+        try:
+            from app.mcp_sse_async_client import MCPSSEAsyncClient
+            async with MCPSSEAsyncClient(base_url) as client:
+                result = await client.read_resource(resource_uri, filters)
+                contents = result.get("contents", [])[:10]
+
+                # 生成分块建议
+                chunking_suggestion = client.suggest_chunking(contents, {})
+
+                return {
+                    "success": True,
+                    "sample_data": contents,
+                    "schema": {},
+                    "chunking_suggestion": chunking_suggestion,
+                    "total_count": len(result.get("contents", []))
+                }
+        except Exception as sse_error:
+            logger.warning(f"[MCP] SSE 传输失败，尝试 HTTP REST: {sse_error}")
+
+        # 回退到 HTTP REST
+        from app.mcp_client import MCPClient
+        client = MCPClient(base_url)
+
+        try:
+            # 读取样本数据（限制数量）
+            result = client.read_resource(resource_uri, filters)
+            contents = result.get("contents", [])[:10]  # 只取前10条作为样本
+
+            # 获取 Schema
+            schema = client.get_resource_schema(resource_uri)
+
+            # 生成分块建议
+            chunking_suggestion = client.suggest_chunking(contents, schema)
+
+            return {
+                "success": True,
+                "sample_data": contents,
+                "schema": schema,
+                "chunking_suggestion": chunking_suggestion,
+                "total_count": len(result.get("contents", []))
+            }
+        finally:
+            client.close()
+
+    except Exception as e:
+        logger.error(f"[preview_mcp] 失败: {e}", exc_info=True)
+        return {"success": False, "detail": str(e)}
+
+
+@app.post(
+    "/api/mcp/discover/tools",
+    summary="发现 MCP Tools",
+    description="连接到 MCP 服务器并发现可用的工具（支持 SSE 传输）",
+    operation_id="discoverMCPTools",
+    tags=["MCP 数据源"],
+)
+async def discover_mcp_tools(request: Dict[str, str]):
+    """发现 MCP 服务器提供的工具"""
+    try:
+        base_url = request.get("base_url", "")
+        if not base_url:
+            raise HTTPException(status_code=400, detail="base_url 不能为空")
+
+        # 使用异步 SSE 客户端
+        try:
+            from app.mcp_sse_async_client import MCPSSEAsyncClient
+            async with MCPSSEAsyncClient(base_url) as client:
+                tools = await client.list_tools()
+                logger.info(f"[MCP] 使用 SSE 传输发现 {len(tools)} 个工具")
+                return {
+                    "success": True,
+                    "tools": tools,
+                    "server_url": base_url,
+                    "transport": "sse"
+                }
+        except Exception as sse_error:
+            logger.error(f"[MCP] SSE 传输失败: {sse_error}")
+            return {"success": False, "detail": str(sse_error)}
+
+    except Exception as e:
+        logger.error(f"[discover_mcp_tools] 失败: {e}", exc_info=True)
+        return {"success": False, "detail": str(e)}
+
+
+@app.post(
+    "/api/mcp/call/tool",
+    summary="调用 MCP Tool",
+    description="调用 MCP 服务器的工具并获取数据",
+    operation_id="callMCPTool",
+    tags=["MCP 数据源"],
+)
+async def call_mcp_tool(request: Dict[str, Any]):
+    """调用 MCP 工具"""
+    try:
+        base_url = request.get("base_url", "")
+        tool_name = request.get("tool_name", "")
+        arguments = request.get("arguments", {})
+
+        if not base_url or not tool_name:
+            raise HTTPException(status_code=400, detail="base_url 和 tool_name 不能为空")
+
+        # 使用 SSE 传输
+        from app.mcp_sse_async_client import MCPSSEAsyncClient
+        async with MCPSSEAsyncClient(base_url) as client:
+            result = await client.call_tool(tool_name, arguments)
+
+            # 提取内容
+            contents = []
+            if isinstance(result, dict):
+                if "content" in result:
+                    # MCP 标准响应格式
+                    content_list = result["content"]
+                    if isinstance(content_list, list):
+                        for item in content_list:
+                            if isinstance(item, dict) and "text" in item:
+                                contents.append({"text": item["text"]})
+                            else:
+                                contents.append({"text": str(item)})
+                    else:
+                        contents.append({"text": str(content_list)})
+                else:
+                    # 直接返回的数据
+                    contents.append({"text": str(result)})
+            elif isinstance(result, list):
+                contents = [{"text": str(item)} for item in result]
+            else:
+                contents.append({"text": str(result)})
+
+            logger.info(f"[MCP] 调用工具 {tool_name} 成功，获取 {len(contents)} 条数据")
+
+            return {
+                "success": True,
+                "data": contents[:10],  # 只返回前10条作为预览
+                "total_count": len(contents),
+                "raw_result": result
+            }
+
+    except Exception as e:
+        logger.error(f"[call_mcp_tool] 失败: {e}", exc_info=True)
         return {"success": False, "detail": str(e)}

@@ -1,11 +1,12 @@
 """
 文档加载与分块模块
 支持将 CRM markdown 文件按活动记录分割成语义完整的块
+支持通过 MCP 协议从外部数据源加载数据
 """
 import re
 from pathlib import Path
 from typing import List, Dict, Any
-from app.config import CHUNK_SIZE, CHUNK_OVERLAP, DATA_DIR
+from app.config import CHUNK_SIZE, CHUNK_OVERLAP, DATA_DIR, BASE_DIR
 
 
 def load_markdown_files(data_dir: Path = DATA_DIR) -> List[Dict[str, Any]]:
@@ -131,12 +132,139 @@ def split_long_text(text: str, source: str, base_idx: int) -> List[Dict[str, Any
     return chunks
 
 
-def load_and_split(data_dir: Path = DATA_DIR) -> List[Dict[str, Any]]:
-    """加载所有文档并分块，返回所有片段列表"""
+def load_and_split(data_dir: Path = DATA_DIR, enable_mcp: bool = True) -> List[Dict[str, Any]]:
+    """
+    加载所有文档并分块，返回所有片段列表
+
+    Args:
+        data_dir: 本地数据目录
+        enable_mcp: 是否启用 MCP 数据源
+    """
+    # 1. 加载本地 markdown 文件
     docs = load_markdown_files(data_dir)
+
+    # 2. 加载 MCP 数据源（如果启用）
+    mcp_docs = []
+    if enable_mcp:
+        try:
+            from app.mcp_loader import MCPDataLoader
+            mcp_config_path = BASE_DIR / "mcp_config.json"
+            if mcp_config_path.exists():
+                print(f"\n[MCP] 加载配置: {mcp_config_path}")
+                mcp_loader = MCPDataLoader(mcp_config_path)
+                mcp_docs = mcp_loader.fetch_all()
+                if mcp_docs:
+                    print(f"[MCP] 从 MCP 数据源获取 {len(mcp_docs)} 个文档")
+            else:
+                print(f"[MCP] 配置文件不存在，跳过 MCP 数据源: {mcp_config_path}")
+        except Exception as e:
+            print(f"[MCP] 加载 MCP 数据源失败: {e}")
+
+    # 3. 分块处理
     all_chunks = []
+
+    # 处理本地 markdown 文件（使用 CRM 格式分块）
     for doc in docs:
         chunks = split_by_activity(doc["content"], doc["source"])
         all_chunks.extend(chunks)
-    print(f"\n[分块完成] 共 {len(docs)} 个文件，{len(all_chunks)} 个片段")
+
+    # 处理 MCP 数据源（使用通用分块策略）
+    for doc in mcp_docs:
+        chunks = split_mcp_document(doc)
+        all_chunks.extend(chunks)
+
+    print(f"\n[分块完成] 共 {len(docs) + len(mcp_docs)} 个文件，{len(all_chunks)} 个片段")
     return all_chunks
+
+
+def split_mcp_document(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    对 MCP 数据源文档进行分块
+
+    策略：
+    1. 如果文档已包含元数据（date, company, owner），视为单个活动记录，不拆分
+    2. 如果文档较短（<= CHUNK_SIZE），保持完整
+    3. 如果文档较长，按段落拆分，保留重叠
+    """
+    content = doc.get("content", "")
+    source = doc.get("source", "unknown")
+    metadata = doc.get("metadata", {})
+
+    # 提取元数据
+    date = metadata.get("date", "")
+    company = metadata.get("company", "")
+    owner = metadata.get("owner", "")
+
+    # 如果文档较短或已有完整元数据，不拆分
+    if len(content) <= CHUNK_SIZE or (date and company and owner):
+        return [{
+            "text": content,
+            "source": source,
+            "chunk_id": 0,
+            "type": "mcp_doc",
+            "date": date,
+            "company": company,
+            "owner": owner,
+        }]
+
+    # 文档较长，按段落拆分
+    chunks = []
+    paragraphs = content.split('\n\n')
+    current = []
+    current_len = 0
+    chunk_idx = 0
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        para_len = len(para)
+
+        # 如果当前段落加入后超过限制，先保存当前块
+        if current_len + para_len > CHUNK_SIZE and current:
+            chunk_text = '\n\n'.join(current)
+            chunks.append({
+                "text": chunk_text,
+                "source": source,
+                "chunk_id": chunk_idx,
+                "type": "mcp_doc_part",
+                "date": date,
+                "company": company,
+                "owner": owner,
+            })
+            chunk_idx += 1
+
+            # 保留重叠部分
+            if CHUNK_OVERLAP > 0 and len(chunk_text) > CHUNK_OVERLAP:
+                overlap_text = chunk_text[-CHUNK_OVERLAP:]
+                current = [overlap_text, para]
+                current_len = len(overlap_text) + para_len + 2
+            else:
+                current = [para]
+                current_len = para_len
+        else:
+            current.append(para)
+            current_len += para_len + 2  # +2 for '\n\n'
+
+    # 保存最后一块
+    if current:
+        chunks.append({
+            "text": '\n\n'.join(current),
+            "source": source,
+            "chunk_id": chunk_idx,
+            "type": "mcp_doc_part",
+            "date": date,
+            "company": company,
+            "owner": owner,
+        })
+
+    return chunks if chunks else [{
+        "text": content,
+        "source": source,
+        "chunk_id": 0,
+        "type": "mcp_doc",
+        "date": date,
+        "company": company,
+        "owner": owner,
+    }]
