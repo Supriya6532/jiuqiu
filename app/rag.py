@@ -13,9 +13,9 @@ import httpx
 
 from app.config import (
     CHAT_API_KEY, CHAT_BASE_URL, OPENAI_CHAT_MODEL, TOP_K, CHAT_API_MODE,
-    ADVANCED_RAG_ENABLED,
+    ADVANCED_RAG_ENABLED, SUMMARY_RAG_ENABLED,
 )
-from app.vector_store import search, get_aggregate_stats, query_by_metadata, get_distinct_values, get_field_activity_counts
+from app.vector_store import search, get_aggregate_stats, query_by_metadata, get_distinct_values, get_field_activity_counts, fetch_originals
 from app.advanced_rag import advanced_retrieve
 
 logger = logging.getLogger("crm_rag")
@@ -503,6 +503,10 @@ def answer(question: str, top_k: int = TOP_K) -> Dict[str, Any]:
             else:
                 hits = search(question, top_k=top_k)
                 logger.info(f"[answer] 语义检索到 {len(hits)} 条相关片段")
+            # 摘要模式：用摘要检索，用原文生成回答
+            if SUMMARY_RAG_ENABLED and hits:
+                hits = fetch_originals(hits)
+                logger.info(f"[answer] 摘要模式：已替换为 {len(hits)} 条原始记录")
             context = build_context(hits)
             sources = list({h["source"] for h in hits})
 
@@ -620,6 +624,10 @@ def answer_stream(question: str, top_k: int = TOP_K) -> Iterator[str]:
                 logger.error(f"[stream] 检索失败: {e}")
                 yield f"data: {json.dumps({'type': 'error', 'content': f'检索失败: {e}'}, ensure_ascii=False)}\n\n"
                 return
+            # 摘要模式：用摘要检索，用原文生成回答
+            if SUMMARY_RAG_ENABLED and hits:
+                hits = fetch_originals(hits)
+                logger.info(f"[stream] 摘要模式：已替换为 {len(hits)} 条原始记录")
             sources = list({h["source"] for h in hits})
             context = build_context(hits)
 

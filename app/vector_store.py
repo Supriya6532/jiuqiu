@@ -17,7 +17,8 @@ from pymilvus import (
 from app.config import (
     EMBEDDING_API_KEY, EMBEDDING_BASE_URL, OPENAI_EMBEDDING_MODEL,
     EMBEDDING_DIMENSION, MILVUS_HOST, MILVUS_PORT,
-    MILVUS_COLLECTION, TOP_K, SCORE_THRESHOLD, BASE_DIR
+    MILVUS_COLLECTION, TOP_K, SCORE_THRESHOLD, BASE_DIR,
+    SUMMARY_RAG_ENABLED,
 )
 
 # ========== Embedding 磁盘缓存 ==========
@@ -255,6 +256,26 @@ def build_index(chunks: List[Dict[str, Any]]) -> int:
     # 写入 Milvus
     col.insert([texts, sources, chunk_ids, chunk_types, dates, companies, owners, embeddings])
     col.flush()
+
+    # 摘要向量检索：生成摘要并追加写入
+    if SUMMARY_RAG_ENABLED:
+        from app.document_loader import generate_summaries
+        summary_chunks = generate_summaries(chunks)
+        if summary_chunks:
+            s_texts       = [truncate_to_bytes(c["text"], MAX_BYTES) for c in summary_chunks]
+            s_sources     = [c.get("source", "")                     for c in summary_chunks]
+            s_chunk_ids   = [str(c.get("chunk_id", ""))              for c in summary_chunks]
+            s_chunk_types = [c.get("type", "summary")                for c in summary_chunks]
+            s_dates       = [c.get("date", "")                       for c in summary_chunks]
+            s_companies   = [c.get("company", "")                    for c in summary_chunks]
+            s_owners      = [c.get("owner", "")                      for c in summary_chunks]
+
+            print(f"[向量化] 开始向量化 {len(s_texts)} 条摘要...")
+            s_embeddings = embed_texts(s_texts)
+            col.insert([s_texts, s_sources, s_chunk_ids, s_chunk_types, s_dates, s_companies, s_owners, s_embeddings])
+            col.flush()
+            print(f"[Milvus] 追加写入 {len(s_texts)} 条摘要记录")
+
     count = col.num_entities
     print(f"[Milvus] 写入完成，集合共 {count} 条记录")
     return count
@@ -407,10 +428,16 @@ def search(query: str, top_k: int = TOP_K, expr: str = "") -> List[Dict[str, Any
     """
     相似度检索：将 query 向量化，在 Milvus 中检索最相关片段。
     可选传入 expr 实现向量检索 + 元数据过滤的混合查询。
+    当 SUMMARY_RAG_ENABLED 时，自动只检索 summary 类型的 chunk。
     返回 [{text, source, score, ...}, ...]
     """
     connect_milvus()
     col = ensure_collection()
+
+    # 摘要模式：只检索 summary chunk
+    if SUMMARY_RAG_ENABLED:
+        summary_filter = 'chunk_type == "summary"'
+        expr = f"({expr}) and {summary_filter}" if expr else summary_filter
 
     query_embedding = embed_texts([query])[0]
 
@@ -439,3 +466,50 @@ def search(query: str, top_k: int = TOP_K, expr: str = "") -> List[Dict[str, Any
             })
 
     return hits
+
+
+def fetch_originals(summary_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    根据 summary 检索命中结果，查回对应的原始 activity 记录。
+    通过 chunk_id + source 关联，chunk_type 为 activity 或 activity_part。
+    返回的列表保持与 summary_hits 相同的顺序，每条包含原始文本和元数据。
+    """
+    if not summary_hits:
+        return []
+
+    connect_milvus()
+    col = ensure_collection()
+
+    originals = []
+    for hit in summary_hits:
+        chunk_id = hit.get("chunk_id", "")
+        source = hit.get("source", "")
+        expr = (
+            f'chunk_id == "{chunk_id}" '
+            f'and source == "{source}" '
+            f'and (chunk_type == "activity" or chunk_type == "activity_part")'
+        )
+        rows = col.query(
+            expr=expr,
+            output_fields=["text", "source", "chunk_id", "chunk_type", "date", "company", "owner"],
+            limit=10,
+        )
+        if rows:
+            # 拼合同一活动的所有 part
+            rows.sort(key=lambda r: r.get("chunk_id", ""))
+            full_text = "\n\n".join(r.get("text", "") for r in rows)
+            originals.append({
+                "text":       full_text,
+                "source":     hit.get("source", ""),
+                "chunk_id":   hit.get("chunk_id", ""),
+                "chunk_type": "activity",
+                "date":       hit.get("date", ""),
+                "company":    hit.get("company", ""),
+                "owner":      hit.get("owner", ""),
+                "score":      hit.get("score", 0),
+            })
+        else:
+            # 找不到原文，回退使用摘要本身
+            originals.append(hit)
+
+    return originals

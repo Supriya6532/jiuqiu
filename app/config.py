@@ -70,6 +70,12 @@ ADVANCED_RAG_RERANK_TOP_N = int(os.getenv("ADVANCED_RAG_RERANK_TOP_N", "10"))   
 # 4. 父文档检索：子块命中时自动拼合完整父活动记录
 ADVANCED_RAG_PARENT_DOC = os.getenv("ADVANCED_RAG_PARENT_DOC", "true").lower() == "true"
 
+# ========== 摘要向量检索配置 ==========
+# 索引时为每条活动记录生成 LLM 摘要，用摘要向量检索，用原文生成回答
+SUMMARY_RAG_ENABLED = os.getenv("SUMMARY_RAG_ENABLED", "false").lower() == "true"
+SUMMARY_LLM_MODEL = os.getenv("SUMMARY_LLM_MODEL", OPENAI_CHAT_MODEL)
+SUMMARY_MAX_CONCURRENCY = int(os.getenv("SUMMARY_MAX_CONCURRENCY", "5"))
+
 # ========== 飞书机器人配置（长连接模式，无需公网域名）==========
 # 飞书开放平台 -> 凭证与基础信息 -> App ID / App Secret
 FEISHU_BOT_ENABLED = os.getenv("FEISHU_BOT_ENABLED", "false").lower() == "true"

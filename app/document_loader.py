@@ -4,9 +4,12 @@
 支持通过 MCP 协议从外部数据源加载数据
 """
 import re
+import logging
 from pathlib import Path
 from typing import List, Dict, Any
 from app.config import CHUNK_SIZE, CHUNK_OVERLAP, DATA_DIR, BASE_DIR
+
+logger = logging.getLogger(__name__)
 
 
 def load_markdown_files(data_dir: Path = DATA_DIR) -> List[Dict[str, Any]]:
@@ -268,3 +271,83 @@ def split_mcp_document(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
         "company": company,
         "owner": owner,
     }]
+
+
+# ========== 摘要生成（Summary RAG） ==========
+
+SUMMARY_PROMPT = """请将以下 CRM 活动记录总结为简洁的结构化摘要，包含：
+- 客户名称
+- 沟通日期
+- 核心结论（1-2句话）
+- 关键待办事项
+
+只输出摘要，不要解释。
+
+活动记录：
+{text}"""
+
+
+def generate_summary(text: str, client, model: str) -> str:
+    """调用 LLM 为单条活动记录生成摘要"""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": SUMMARY_PROMPT.format(text=text)}],
+            temperature=0.1,
+            max_tokens=512,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.warning(f"[摘要生成] 失败，使用原文前200字: {e}")
+        return text[:200]
+
+
+def generate_summaries(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    为 activity 类型的 chunks 批量生成摘要，返回 summary chunks 列表。
+    摘要 chunk 与原始 chunk 共享 chunk_id/source/date/company/owner，chunk_type="summary"。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from openai import OpenAI
+    from app.config import (
+        CHAT_API_KEY, CHAT_BASE_URL,
+        SUMMARY_LLM_MODEL, SUMMARY_MAX_CONCURRENCY,
+    )
+
+    activity_chunks = [c for c in chunks if c.get("type") == "activity"]
+    if not activity_chunks:
+        logger.info("[摘要生成] 没有 activity 类型的 chunk，跳过")
+        return []
+
+    client = OpenAI(api_key=CHAT_API_KEY, base_url=CHAT_BASE_URL)
+    summary_chunks = []
+    total = len(activity_chunks)
+    logger.info(f"[摘要生成] 开始为 {total} 条活动记录生成摘要 (model={SUMMARY_LLM_MODEL}, concurrency={SUMMARY_MAX_CONCURRENCY})")
+
+    def _process(chunk):
+        summary_text = generate_summary(chunk["text"], client, SUMMARY_LLM_MODEL)
+        return {
+            "text": summary_text,
+            "source": chunk["source"],
+            "chunk_id": chunk["chunk_id"],
+            "type": "summary",
+            "date": chunk.get("date", ""),
+            "company": chunk.get("company", ""),
+            "owner": chunk.get("owner", ""),
+        }
+
+    with ThreadPoolExecutor(max_workers=SUMMARY_MAX_CONCURRENCY) as pool:
+        futures = {pool.submit(_process, c): i for i, c in enumerate(activity_chunks)}
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            try:
+                summary_chunks.append(future.result())
+            except Exception as e:
+                idx = futures[future]
+                logger.error(f"[摘要生成] chunk {idx} 失败: {e}")
+            if done % 50 == 0 or done == total:
+                logger.info(f"[摘要生成] 进度 {done}/{total}")
+
+    logger.info(f"[摘要生成] 完成，生成 {len(summary_chunks)} 条摘要")
+    return summary_chunks
