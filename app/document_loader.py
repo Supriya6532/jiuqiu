@@ -351,3 +351,71 @@ def generate_summaries(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     logger.info(f"[摘要生成] 完成，生成 {len(summary_chunks)} 条摘要")
     return summary_chunks
+
+
+# ========== 文件解析（上传功能） ==========
+
+def parse_uploaded_file(filename: str, content: bytes) -> str:
+    """
+    解析上传的文件内容，支持 .md, .txt, .pdf
+    返回纯文本内容
+    """
+    ext = filename.lower().split('.')[-1]
+
+    if ext in ('md', 'txt'):
+        # Markdown 和文本文件直接解码
+        try:
+            return content.decode('utf-8')
+        except UnicodeDecodeError:
+            return content.decode('gbk', errors='ignore')
+
+    elif ext == 'pdf':
+        # PDF 文件解析
+        try:
+            from pypdf import PdfReader
+            from io import BytesIO
+
+            pdf_file = BytesIO(content)
+            reader = PdfReader(pdf_file)
+            text_parts = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    text_parts.append(text)
+            return '\n\n'.join(text_parts)
+        except Exception as e:
+            logger.error(f"[文件解析] PDF 解析失败 {filename}: {e}")
+            raise ValueError(f"PDF 解析失败: {e}")
+
+    else:
+        raise ValueError(f"不支持的文件格式: .{ext}")
+
+
+def process_uploaded_file(filename: str, content: bytes) -> List[Dict[str, Any]]:
+    """
+    处理上传的文件：解析 -> 分块 -> 返回 chunks
+    """
+    logger.info(f"[文件上传] 开始处理: {filename}")
+
+    # 1. 解析文件内容
+    text = parse_uploaded_file(filename, content)
+    if not text.strip():
+        raise ValueError("文件内容为空")
+
+    logger.info(f"[文件上传] 解析完成，共 {len(text)} 字符")
+
+    # 2. 判断文件类型并分块
+    # 如果是 CRM 格式的 markdown，按活动记录分块
+    if filename.lower().endswith('.md') and '---' in text and '###' in text:
+        chunks = split_by_activity(text, filename)
+        logger.info(f"[文件上传] CRM 格式分块，共 {len(chunks)} 个活动记录")
+    else:
+        # 通用文档，按段落分块
+        chunks = split_mcp_document({
+            'content': text,
+            'source': filename,
+            'metadata': {}
+        })
+        logger.info(f"[文件上传] 通用格式分块，共 {len(chunks)} 个片段")
+
+    return chunks

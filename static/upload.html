@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>文件上传 - CRM 知识库</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --bg: #f1f5f9;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --text: #1e293b;
+      --muted: #64748b;
+      --success: #22c55e;
+      --error: #ef4444;
+      --shadow: 0 1px 3px rgba(0,0,0,.08), 0 4px 16px rgba(0,0,0,.04);
+      --radius: 12px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+                   'Microsoft YaHei', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    header {
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 24px;
+      box-shadow: var(--shadow);
+    }
+
+    h1 {
+      font-size: 24px;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .nav-link {
+      display: inline-block;
+      margin-top: 12px;
+      color: var(--primary);
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    .nav-link:hover {
+      text-decoration: underline;
+    }
+
+    .upload-card {
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 32px;
+      box-shadow: var(--shadow);
+      margin-bottom: 24px;
+    }
+
+    .upload-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 48px 24px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.3s;
+      margin-bottom: 24px;
+    }
+
+    .upload-zone:hover {
+      border-color: var(--primary);
+      background: #f8fafc;
+    }
+
+    .upload-zone.dragover {
+      border-color: var(--primary);
+      background: #eff6ff;
+    }
+
+    .upload-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+    }
+
+    .upload-text {
+      font-size: 16px;
+      margin-bottom: 8px;
+    }
+
+    .upload-hint {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    #file-input {
+      display: none;
+    }
+
+    .file-list {
+      margin-top: 24px;
+    }
+
+    .file-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      background: #f8fafc;
+    }
+
+    .file-info {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .file-name {
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .file-size {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .file-status {
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+
+    .file-status.pending {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .file-status.uploading {
+      background: #dbeafe;
+      color: #1e40af;
+    }
+
+    .file-status.success {
+      background: #d1fae5;
+      color: #065f46;
+    }
+
+    .file-status.error {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+
+    .remove-btn {
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 18px;
+      padding: 4px 8px;
+    }
+
+    .remove-btn:hover {
+      color: var(--error);
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    button {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: white;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: var(--primary-hover);
+    }
+
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-secondary {
+      background: var(--border);
+      color: var(--text);
+    }
+
+    .btn-secondary:hover {
+      background: #cbd5e1;
+    }
+
+    .message {
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-top: 16px;
+      font-size: 14px;
+    }
+
+    .message.success {
+      background: #d1fae5;
+      color: #065f46;
+      border: 1px solid #a7f3d0;
+    }
+
+    .message.error {
+      background: #fee2e2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--primary);
+      transition: width 0.3s;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📁 文件上传</h1>
+      <p class="subtitle">上传 Markdown、PDF 等文件到知识库</p>
+      <a href="/" class="nav-link">← 返回问答页面</a>
+    </header>
+
+    <div class="upload-card">
+      <div class="upload-zone" id="upload-zone">
+        <div class="upload-icon">📄</div>
+        <div class="upload-text">点击或拖拽文件到此处上传</div>
+        <div class="upload-hint">支持 .md, .pdf, .txt 格式，单个文件最大 10MB</div>
+      </div>
+      <input type="file" id="file-input" multiple accept=".md,.pdf,.txt" />
+
+      <div class="file-list" id="file-list"></div>
+
+      <div class="actions">
+        <button class="btn-primary" id="upload-btn" disabled>开始上传</button>
+        <button class="btn-secondary" id="clear-btn">清空列表</button>
+      </div>
+
+      <div id="message"></div>
+    </div>
+  </div>
+
+  <script>
+    const uploadZone = document.getElementById('upload-zone');
+    const fileInput = document.getElementById('file-input');
+    const fileList = document.getElementById('file-list');
+    const uploadBtn = document.getElementById('upload-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const messageDiv = document.getElementById('message');
+
+    let files = [];
+
+    // 点击上传区域
+    uploadZone.addEventListener('click', () => fileInput.click());
+
+    // 文件选择
+    fileInput.addEventListener('change', (e) => {
+      addFiles(Array.from(e.target.files));
+      fileInput.value = '';
+    });
+
+    // 拖拽上传
+    uploadZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      uploadZone.classList.add('dragover');
+    });
+
+    uploadZone.addEventListener('dragleave', () => {
+      uploadZone.classList.remove('dragover');
+    });
+
+    uploadZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      uploadZone.classList.remove('dragover');
+      addFiles(Array.from(e.dataTransfer.files));
+    });
+
+    // 添加文件
+    function addFiles(newFiles) {
+      const validFiles = newFiles.filter(f => {
+        const ext = f.name.split('.').pop().toLowerCase();
+        const valid = ['md', 'pdf', 'txt'].includes(ext) && f.size <= 10 * 1024 * 1024;
+        if (!valid) {
+          showMessage(`文件 ${f.name} 格式不支持或超过 10MB`, 'error');
+        }
+        return valid;
+      });
+
+      validFiles.forEach(f => {
+        files.push({
+          file: f,
+          id: Date.now() + Math.random(),
+          status: 'pending'
+        });
+      });
+
+      renderFileList();
+      updateUploadBtn();
+    }
+
+    // 渲染文件列表
+    function renderFileList() {
+      if (files.length === 0) {
+        fileList.innerHTML = '';
+        return;
+      }
+
+      fileList.innerHTML = files.map(item => `
+        <div class="file-item" data-id="${item.id}">
+          <div class="file-info">
+            <div>
+              <div class="file-name">${item.file.name}</div>
+              <div class="file-size">${formatSize(item.file.size)}</div>
+            </div>
+          </div>
+          <div class="file-status ${item.status}">${getStatusText(item.status)}</div>
+          <button class="remove-btn" onclick="removeFile(${item.id})" ${item.status === 'uploading' ? 'disabled' : ''}>×</button>
+        </div>
+      `).join('');
+    }
+
+    // 移除文件
+    window.removeFile = function(id) {
+      files = files.filter(f => f.id !== id);
+      renderFileList();
+      updateUploadBtn();
+    };
+
+    // 清空列表
+    clearBtn.addEventListener('click', () => {
+      files = files.filter(f => f.status === 'uploading');
+      renderFileList();
+      updateUploadBtn();
+      messageDiv.innerHTML = '';
+    });
+
+    // 上传按钮状态
+    function updateUploadBtn() {
+      const hasPending = files.some(f => f.status === 'pending');
+      uploadBtn.disabled = !hasPending;
+    }
+
+    // 开始上传
+    uploadBtn.addEventListener('click', async () => {
+      const pendingFiles = files.filter(f => f.status === 'pending');
+      if (pendingFiles.length === 0) return;
+
+      uploadBtn.disabled = true;
+      messageDiv.innerHTML = '';
+
+      for (const item of pendingFiles) {
+        item.status = 'uploading';
+        renderFileList();
+
+        try {
+          await uploadFile(item.file);
+          item.status = 'success';
+        } catch (err) {
+          item.status = 'error';
+          console.error('Upload failed:', err);
+        }
+        renderFileList();
+      }
+
+      const successCount = files.filter(f => f.status === 'success').length;
+      const errorCount = files.filter(f => f.status === 'error').length;
+
+      if (errorCount === 0) {
+        showMessage(`✓ 成功上传 ${successCount} 个文件`, 'success');
+      } else {
+        showMessage(`上传完成：${successCount} 成功，${errorCount} 失败`, 'error');
+      }
+
+      updateUploadBtn();
+    });
+
+    // 上传单个文件
+    async function uploadFile(file) {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const resp = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!resp.ok) {
+        const data = await resp.json();
+        throw new Error(data.detail || '上传失败');
+      }
+
+      return resp.json();
+    }
+
+    // 工具函数
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function getStatusText(status) {
+      const map = {
+        pending: '待上传',
+        uploading: '上传中...',
+        success: '成功',
+        error: '失败'
+      };
+      return map[status] || status;
+    }
+
+    function showMessage(text, type) {
+      messageDiv.innerHTML = `<div class="message ${type}">${text}</div>`;
+    }
+  </script>
+</body>
+</html>

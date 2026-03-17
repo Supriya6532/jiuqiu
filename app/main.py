@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,9 +35,8 @@ logger = logging.getLogger("crm_main")
 
 from app.config import API_TITLE, API_VERSION, TOP_K, BASE_DIR
 from app.rag import answer, answer_stream
-from app.vector_store import connect_milvus, ensure_collection, get_aggregate_stats
-from app.document_loader import load_and_split
-from app.vector_store import build_index
+from app.vector_store import connect_milvus, ensure_collection, get_aggregate_stats, build_index
+from app.document_loader import load_and_split, process_uploaded_file
 from app.feishu_bot import start_ws_client
 from app.feedback import init_db, save_qa, save_thumbs, save_manual_scores, trigger_judge, get_stats as get_feedback_stats
 
@@ -201,6 +200,15 @@ async def index_page():
     html_path = BASE_DIR / "static" / "index.html"
     if not html_path.exists():
         raise HTTPException(status_code=404, detail="前端页面未找到，请检查 static/index.html")
+    return FileResponse(str(html_path))
+
+
+@app.get("/upload", include_in_schema=False)
+async def upload_page():
+    """返回文件上传页面"""
+    html_path = BASE_DIR / "static" / "upload.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="上传页面未找到，请检查 static/upload.html")
     return FileResponse(str(html_path))
 
 
@@ -381,6 +389,85 @@ async def get_stats():
         }
     except Exception as e:
         return {"success": False, "detail": str(e)}
+
+
+# ========== 文件上传 ==========
+
+@app.post(
+    "/api/upload",
+    summary="上传文件到知识库",
+    description=(
+        "上传 Markdown、PDF、TXT 文件，自动解析、分块并写入向量库。\n\n"
+        "支持的文件格式：.md, .pdf, .txt\n"
+        "单个文件最大 10MB"
+    ),
+    operation_id="uploadFile",
+    tags=["知识库"],
+)
+async def upload_file(file: UploadFile = File(...)):
+    """上传文件并入库"""
+    # 检查文件大小
+    MAX_SIZE = 10 * 1024 * 1024  # 10MB
+    content = await file.read()
+    if len(content) > MAX_SIZE:
+        raise HTTPException(status_code=400, detail=f"文件过大，最大支持 10MB")
+
+    # 检查文件格式
+    filename = file.filename or "unknown"
+    ext = filename.lower().split('.')[-1]
+    if ext not in ('md', 'pdf', 'txt'):
+        raise HTTPException(status_code=400, detail=f"不支持的文件格式: .{ext}")
+
+    try:
+        # 解析并分块
+        chunks = process_uploaded_file(filename, content)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="文件内容为空或解析失败")
+
+        # 写入向量库（增量追加）
+        connect_milvus()
+        col = ensure_collection()
+
+        # 准备数据
+        from app.vector_store import embed_texts
+        MAX_BYTES = 8000
+
+        def truncate_to_bytes(s: str, max_bytes: int) -> str:
+            encoded = s.encode("utf-8")
+            if len(encoded) <= max_bytes:
+                return s
+            return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+        texts = [truncate_to_bytes(c["text"], MAX_BYTES) for c in chunks]
+        sources = [c.get("source", "") for c in chunks]
+        chunk_ids = [str(c.get("chunk_id", i)) for i, c in enumerate(chunks)]
+        chunk_types = [c.get("type", "activity") for c in chunks]
+        dates = [c.get("date", "") for c in chunks]
+        companies = [c.get("company", "") for c in chunks]
+        owners = [c.get("owner", "") for c in chunks]
+
+        logger.info(f"[文件上传] 开始向量化 {len(texts)} 个片段...")
+        embeddings = embed_texts(texts)
+
+        # 插入 Milvus
+        col.insert([texts, sources, chunk_ids, chunk_types, dates, companies, owners, embeddings])
+        col.flush()
+
+        logger.info(f"[文件上传] 成功写入 {len(chunks)} 条记录")
+
+        return {
+            "success": True,
+            "message": f"文件 {filename} 上传成功",
+            "filename": filename,
+            "chunk_count": len(chunks),
+            "total_docs": col.num_entities,
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[文件上传] 失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"文件处理失败: {e}")
 
 
 # ========== 反馈 & 质量看板 ==========
